@@ -1,10 +1,11 @@
 import argparse
+import sys
 
 from utils.helpers import read_lines, normalize
 from gector.gec_model import GecBERTModel
+from IPython import embed
 
-
-def predict_for_file(input_file, output_file, model, batch_size=32, to_normalize=False):
+def predict_for_file(input_file, output_file, model, batch_size=32, to_normalize=False, keep_labels=False):
     test_data = read_lines(input_file)
     predictions = []
     cnt_corrections = 0
@@ -12,16 +13,20 @@ def predict_for_file(input_file, output_file, model, batch_size=32, to_normalize
     for sent in test_data:
         batch.append(sent.split())
         if len(batch) == batch_size:
-            preds, cnt = model.handle_batch(batch)
+            preds, cnt = model.handle_batch(batch, keep_labels)
             predictions.extend(preds)
             cnt_corrections += cnt
             batch = []
     if batch:
-        preds, cnt = model.handle_batch(batch)
+        preds, cnt = model.handle_batch(batch, keep_labels)
         predictions.extend(preds)
         cnt_corrections += cnt
 
     result_lines = [" ".join(x) for x in predictions]
+
+    # embed(header="INSIDE (middle): predict_for_file")
+    # sys.exit(1)
+    
     if to_normalize:
         result_lines = [normalize(line) for line in result_lines]
 
@@ -48,7 +53,8 @@ def main(args):
 
     cnt_corrections = predict_for_file(args.input_file, args.output_file, model,
                                        batch_size=args.batch_size, 
-                                       to_normalize=args.normalize)
+                                       to_normalize=args.normalize,
+                                       keep_labels=args.tagged_tokens)
     # evaluate with m2 or ERRANT
     print(f"Produced overall corrections: {cnt_corrections}")
 
@@ -87,6 +93,10 @@ if __name__ == '__main__':
                         type=int,
                         help='Whether to lowercase tokens.',
                         default=0)
+    parser.add_argument('--tagged_tokens',
+                        help='Whether to output a sentence with the edits applied (i.e., grammatical sentence)'
+                             'or a sentence without the edits applied (i.e., ungrammatical sentence)',
+                        action='store_true')
     parser.add_argument('--transformer_model',
                         choices=['bert', 'gpt2', 'transformerxl', 'xlnet', 'distilbert', 'roberta', 'albert'
                                  'bert-large', 'roberta-large', 'xlnet-large'],
