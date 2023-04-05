@@ -1,8 +1,10 @@
 """Wrapper of AllenNLP model. Fixes errors based on model predictions"""
+from email import header
 import logging
 import os
 import sys
 from time import time
+from IPython import embed
 
 import torch
 from allennlp.data.dataset import Batch
@@ -18,6 +20,7 @@ from gector.seq2labels_model import Seq2Labels
 from gector.tokenizer_indexer import PretrainedBertIndexer
 from utils.helpers import PAD, UNK, get_target_sent_by_edits, START_TOKEN
 from utils.helpers import get_weights_name
+from utils.helpers import merge_edits
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 logger = logging.getLogger(__file__)
@@ -117,8 +120,9 @@ class GecBERTModel(object):
             with torch.no_grad():
                 prediction = model.forward(**batch)
             predictions.append(prediction)
-
+        
         preds, idx, error_probs = self._convert(predictions)
+        
         t55 = time()
         if self.log:
             print(f"Inference time {t55 - t11}")
@@ -196,6 +200,7 @@ class GecBERTModel(object):
         max_vals = torch.max(all_class_probs, dim=-1)
         probs = max_vals[0].tolist()
         idx = max_vals[1].tolist()
+        
         return probs, idx, error_probs.tolist()
 
     def update_final_batch(self, final_batch, pred_ids, pred_batch,
@@ -217,7 +222,77 @@ class GecBERTModel(object):
                 total_updated += 1
             else:
                 continue
+
         return final_batch, new_pred_ids, total_updated
+
+
+    def tagged_final_batch(self, raw_batch, edits_in_batch):
+
+        tagged_batch = []
+
+        for idx in range(len(raw_batch)):
+            tagged_batch.append([tokens_tuple[0] if None in tokens_tuple else "###".join(tokens_tuple) for tokens_tuple in zip(raw_batch[idx], edits_in_batch[idx])] )
+
+        return tagged_batch
+
+    # This function is essentially the same as postprocess_batch.
+    # It should be used whenever we would like as output 
+    # the RAW SENTENCE + the necessary edits to make it CORRECT
+    # instead of the CORRECT SENTENCE (i.e., token transformations applied)
+    def postprocess_batch_with_labels(self, batch, all_probabilities, all_idxs,
+                          error_probs):
+        all_results_gram = []
+        results_edits = []
+        noop_index = self.vocab.get_token_index("$KEEP", "labels")
+
+        for tokens, probabilities, idxs, error_prob in zip(batch,
+                                                           all_probabilities,
+                                                           all_idxs,
+                                                           error_probs):
+            
+            length = min(len(tokens), self.max_len)
+            edits = []
+            tokens_edits_labels = [None] * length
+
+            # skip whole sentences if there are no errors
+            if max(idxs) == 0:
+                all_results_gram.append(tokens)
+                results_edits.append([None] * length)
+                continue
+
+            # skip whole sentence if probability of correctness is not high
+            if error_prob < self.min_error_probability:
+                all_results_gram.append(tokens)
+                results_edits.append([None] * length)
+                continue
+
+            for i in range(length + 1):
+                # because of START token
+                if i == 0:
+                    token = START_TOKEN
+                else:
+                    token = tokens[i - 1]
+                # skip if there is no error
+                if idxs[i] == noop_index:
+                    continue
+
+                sugg_token = self.vocab.get_token_from_index(idxs[i],
+                                                             namespace='labels')
+                action = self.get_token_action(token, i, probabilities[i],
+                                               sugg_token)
+                
+                tokens_edits_labels[i-1] = sugg_token
+                
+                if not action:
+                    continue
+
+                edits.append(action)
+            
+            all_results_gram.append(get_target_sent_by_edits(tokens, edits))
+            results_edits.append(tokens_edits_labels)
+        
+        return all_results_gram, results_edits
+
 
     def postprocess_batch(self, batch, all_probabilities, all_idxs,
                           error_probs):
@@ -227,6 +302,7 @@ class GecBERTModel(object):
                                                            all_probabilities,
                                                            all_idxs,
                                                            error_probs):
+        
             length = min(len(tokens), self.max_len)
             edits = []
 
@@ -261,10 +337,19 @@ class GecBERTModel(object):
             all_results.append(get_target_sent_by_edits(tokens, edits))
         return all_results
 
-    def handle_batch(self, full_batch):
+
+    # New parameter:    keep_labels
+    #                   It will control whether we output a raw sentence
+    #                   as a corrected sentence or a raw sentence "annotated" with
+    #                   the token transformations the model predicted need to be made
+    def handle_batch(self, full_batch, keep_labels=False):
         """
         Handle batch of requests.
         """
+
+        # final_batch starts with tokenized raw sentences (i.e., no edits/transformations have been made)
+        # final_batch will be updated later based on the model's predictions (edits)
+        # and will end containing corrected sentences
         final_batch = full_batch[:]
         batch_size = len(full_batch)
         prev_preds_dict = {i: [final_batch[i]] for i in range(len(final_batch))}
@@ -273,26 +358,54 @@ class GecBERTModel(object):
         pred_ids = [i for i in range(len(full_batch)) if i not in short_ids]
         total_updates = 0
 
+        edits_cache = []
+        
         for n_iter in range(self.iterations):
+            
+            # This batch is meant to only keep sentences 
+            # that need an edit (i.e., the model predicted that a 
+            # correction should be made)
             orig_batch = [final_batch[i] for i in pred_ids]
 
             sequences = self.preprocess(orig_batch)
+            sequences_back = self.preprocess(final_batch)
 
             if not sequences:
                 break
             probabilities, idxs, error_probs = self.predict(sequences)
+            probabilities_back, idxs_back, error_probs_back = self.predict(sequences_back)
 
-            pred_batch = self.postprocess_batch(orig_batch, probabilities,
-                                                idxs, error_probs)
+            # This part controls the final output        
+            if keep_labels:
+                pred_batch, edits_in_sents = self.postprocess_batch_with_labels(final_batch, 
+                                                    probabilities_back, idxs_back, error_probs_back)
+                
+                # Keep track of all the edits made so far
+                # on each one of the sentences in the batch
+                if edits_in_sents:
+                    edits_cache = merge_edits(edits_in_sents, edits_cache)
+                                   
+            else:
+                pred_batch = self.postprocess_batch(orig_batch, probabilities,
+                                                    idxs, error_probs)
+
             if self.log:
                 print(f"Iteration {n_iter + 1}. Predicted {round(100*len(pred_ids)/batch_size, 1)}% of sentences.")
 
+
+            # Pretty much what happens here is that final_batch (with raw sents)
+            # is merged with pred_batch (with corrected sents)
+            # Raw sentences in final_batch are replaced (in place) with their
+            # corrected version
             final_batch, pred_ids, cnt = \
                 self.update_final_batch(final_batch, pred_ids, pred_batch,
                                         prev_preds_dict)
             total_updates += cnt
-
+            
             if not pred_ids:
                 break
-
-        return final_batch, total_updates
+        
+        if keep_labels:
+            return self.tagged_final_batch(full_batch, edits_cache), total_updates
+        else: 
+            return final_batch, total_updates
