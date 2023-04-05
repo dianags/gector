@@ -133,3 +133,7 @@ dmypy.json
 .idea
 
 *.sh
+
+# Custom
+pretrained_models/
+data/my_data/
