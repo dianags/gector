@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
-
+from IPython import embed
+from itertools import zip_longest
 
 VOCAB_DIR = Path(__file__).resolve().parent.parent / "data"
 PAD = "@@PADDING@@"
@@ -231,3 +232,20 @@ def normalize(sent):
     for fr, to in REPLACEMENTS.items():
         sent = sent.replace(fr, to)
     return sent.lower()
+
+# Auxiliary function to keep track of all the edits (i.e., token transformations)
+# made to a sentence
+def merge_edits(batch_edits_list, cache_list):
+
+    sents_merge_edits = []
+
+    if cache_list:
+        
+        for idx in range(len(batch_edits_list)):
+            sents_merge_edits.append([tokens_tuple[0] if None in tokens_tuple 
+            else "###".join(tokens_tuple) 
+            for tokens_tuple in zip_longest(cache_list[idx], batch_edits_list[idx])])
+        
+        return sents_merge_edits
+    else:
+        return batch_edits_list
